@@ -101,6 +101,41 @@ class ETLPlatformTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5)
 
+    def test_http_run_returns_validation_error_for_legacy_invalid_pipeline(self):
+        with TemporaryDirectory() as temp_dir:
+            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
+            server.platform._state["pipelines"].append(
+                {
+                    "id": "pipe_legacy",
+                    "name": "legacy-invalid",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "source": {
+                        "type": "inline_json",
+                        "config": {"records": [{"id": 1}]},
+                    },
+                    "transformations": [],
+                    "destination": {
+                        "type": "jsonl_file",
+                        "config": {"path": "../escape.jsonl"},
+                    },
+                }
+            )
+            server.platform._save_state()
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            try:
+                status, body = self._request(
+                    port, "POST", "/api/pipelines/pipe_legacy/run", {}
+                )
+                self.assertEqual(status, 400)
+                self.assertIn("Destination path must stay within the platform data directory.", body["error"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
     def test_create_pipeline_rejects_destination_path_escape(self):
         with TemporaryDirectory() as temp_dir:
             platform = ETLPlatform(Path(temp_dir) / "platform_state.json")

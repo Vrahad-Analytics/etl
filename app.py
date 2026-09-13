@@ -105,24 +105,20 @@ class ETLPlatform:
             if pipeline is None:
                 raise KeyError(f"Unknown pipeline: {pipeline_id}")
 
-        run = {
-            "id": f"run_{uuid.uuid4().hex[:12]}",
-            "pipeline_id": pipeline_id,
-            "status": "running",
-            "started_at": utc_now(),
-        }
+        started_at = utc_now()
         records = self._extract(pipeline["source"])
         records = self._transform(records, pipeline.get("transformations", []))
         output_path = self._load(records, pipeline["destination"], pipeline_id)
-        run.update(
-            {
-                "status": "succeeded",
-                "finished_at": utc_now(),
-                "record_count": len(records),
-                "output_path": str(output_path),
-                "preview": records[:5],
-            }
-        )
+        run = {
+            "id": f"run_{uuid.uuid4().hex[:12]}",
+            "pipeline_id": pipeline_id,
+            "status": "succeeded",
+            "started_at": started_at,
+            "finished_at": utc_now(),
+            "record_count": len(records),
+            "output_path": str(output_path),
+            "preview": records[:5],
+        }
 
         with self._lock:
             self._state["runs"].append(run)
@@ -298,6 +294,9 @@ def build_handler(platform):
                 except KeyError:
                     self._json(404, {"error": "Pipeline not found."})
                     return
+                except ValueError as exc:
+                    self._json(400, {"error": str(exc)})
+                    return
                 self._json(201, run)
                 return
 
@@ -341,6 +340,7 @@ def create_server(host="127.0.0.1", port=8000, data_dir="data"):
     state_path = Path(data_dir) / "platform_state.json"
     platform = ETLPlatform(state_path)
     server = ThreadingHTTPServer((host, port), build_handler(platform))
+    server.platform = platform
     return server
 
 
