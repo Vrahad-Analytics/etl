@@ -86,9 +86,7 @@ class ETLPlatformTests(unittest.TestCase):
                     port, "POST", "/api/pipelines", payload
                 )
                 self.assertEqual(create_status, 201)
-                run_status, run = self._request(
-                    port, "POST", f"/api/pipelines/{pipeline['id']}/run", {}
-                )
+                run_status, run = self._request(port, "POST", f"/api/pipelines/{pipeline['id']}/run")
                 self.assertEqual(run_status, 201)
                 self.assertEqual(run["status"], "succeeded")
 
@@ -126,9 +124,7 @@ class ETLPlatformTests(unittest.TestCase):
             port = server.server_address[1]
 
             try:
-                status, body = self._request(
-                    port, "POST", "/api/pipelines/pipe_legacy/run", {}
-                )
+                status, body = self._request(port, "POST", "/api/pipelines/pipe_legacy/run")
                 self.assertEqual(status, 400)
                 self.assertIn("Destination path must stay within the platform data directory.", body["error"])
             finally:
@@ -198,7 +194,7 @@ class ETLPlatformTests(unittest.TestCase):
             port = server.server_address[1]
 
             try:
-                status, body = self._request(port, "POST", "/api/pipelines/run", {})
+                status, body = self._request(port, "POST", "/api/pipelines/run")
                 self.assertEqual(status, 404)
                 self.assertEqual(body["error"], "Not found.")
             finally:
@@ -242,7 +238,7 @@ class ETLPlatformTests(unittest.TestCase):
                 create_status, pipelines = self._request(port, "GET", "/api/pipelines")
                 self.assertEqual(create_status, 200)
                 pipeline_id = pipelines["pipelines"][0]["id"]
-                self._request(port, "POST", f"/api/pipelines/{pipeline_id}/run", {})
+                self._request(port, "POST", f"/api/pipelines/{pipeline_id}/run")
 
                 connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
                 connection.request("GET", "/")
@@ -255,6 +251,45 @@ class ETLPlatformTests(unittest.TestCase):
                 self.assertIn("&lt;b&gt;safe&lt;/b&gt;.jsonl", html)
                 self.assertNotIn("<script>alert(1)</script>", html)
                 self.assertNotIn("<b>safe</b>.jsonl", html)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_http_rejects_symlink_destination_on_run(self):
+        with TemporaryDirectory() as temp_dir:
+            link_path = Path(temp_dir) / "exports" / "symlink.jsonl"
+            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            try:
+                create_status, pipeline = self._request(
+                    port,
+                    "POST",
+                    "/api/pipelines",
+                    {
+                        "name": "symlink-sync",
+                        "source": {
+                            "type": "inline_json",
+                            "config": {"records": [{"id": 1}]},
+                        },
+                        "transformations": [],
+                        "destination": {
+                            "type": "jsonl_file",
+                            "config": {"path": "exports/symlink.jsonl"},
+                        },
+                    },
+                )
+                self.assertEqual(create_status, 201)
+                link_path.parent.mkdir(parents=True, exist_ok=True)
+                link_path.symlink_to(Path(temp_dir).parent / "outside.jsonl")
+                run_status, run = self._request(
+                    port, "POST", f"/api/pipelines/{pipeline['id']}/run"
+                )
+                self.assertEqual(run_status, 400)
+                self.assertIn("Destination path", run["error"])
             finally:
                 server.shutdown()
                 server.server_close()

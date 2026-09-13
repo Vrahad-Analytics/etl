@@ -1,6 +1,9 @@
+import errno
 import json
+import os
 import threading
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -100,7 +103,7 @@ class ETLPlatform:
             pipeline = None
             for item in self._state["pipelines"]:
                 if item["id"] == pipeline_id:
-                    pipeline = item
+                    pipeline = deepcopy(item)
                     break
             if pipeline is None:
                 raise KeyError(f"Unknown pipeline: {pipeline_id}")
@@ -211,9 +214,14 @@ class ETLPlatform:
         configured_path = destination.get("config", {}).get("path")
         output_path = self._resolve_destination_path(configured_path, pipeline_id)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("w", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(json.dumps(record) + "\n")
+        try:
+            with self._open_output_handle(output_path) as handle:
+                for record in records:
+                    handle.write(json.dumps(record) + "\n")
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ValueError("Destination path must not use symlinks.") from exc
+            raise
         return output_path
 
     def _resolve_destination_path(self, configured_path=None, pipeline_id=None):
@@ -231,6 +239,39 @@ class ETLPlatform:
         except ValueError as exc:
             raise ValueError("Destination path must stay within the platform data directory.") from exc
         return resolved_path
+
+    def _open_output_handle(self, output_path):
+        base_dir = self.state_path.parent.resolve()
+        relative_parts = output_path.relative_to(base_dir).parts
+        if not relative_parts:
+            raise ValueError("Destination path must stay within the platform data directory.")
+
+        directory_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+
+        file_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            file_flags |= os.O_NOFOLLOW
+
+        base_fd = os.open(base_dir, directory_flags)
+        current_fd = base_fd
+        try:
+            for part in relative_parts[:-1]:
+                try:
+                    os.mkdir(part, mode=0o755, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+
+            file_fd = os.open(relative_parts[-1], file_flags, 0o644, dir_fd=current_fd)
+            return os.fdopen(file_fd, "w", encoding="utf-8")
+        finally:
+            os.close(current_fd)
 
 
 def build_handler(platform):
@@ -274,11 +315,11 @@ def build_handler(platform):
         def do_POST(self):
             parsed = urlparse(self.path)
             path_parts = [part for part in parsed.path.split("/") if part]
-            payload = self._read_json()
-            if payload is None:
-                return
 
             if parsed.path == "/api/pipelines":
+                payload = self._read_json()
+                if payload is None:
+                    return
                 try:
                     pipeline = platform.create_pipeline(payload)
                 except ValueError as exc:
