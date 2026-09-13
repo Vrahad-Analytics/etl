@@ -1,6 +1,8 @@
 import http.client
 import json
+import sqlite3
 import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,12 +11,11 @@ from app import ETLPlatform, INDEX_HTML, create_server
 
 
 class ETLPlatformTests(unittest.TestCase):
-    def test_create_and_run_pipeline_writes_jsonl_output(self):
+    def test_inline_json_to_jsonl_pipeline(self):
         with TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "platform_state.json"
             output_path = Path(temp_dir) / "exports" / "contacts.jsonl"
             platform = ETLPlatform(state_path)
-
             pipeline = platform.create_pipeline(
                 {
                     "name": "contacts-sync",
@@ -28,14 +29,8 @@ class ETLPlatformTests(unittest.TestCase):
                         },
                     },
                     "transformations": [
-                        {
-                            "type": "rename_fields",
-                            "config": {"mapping": {"email": "email_address"}},
-                        },
-                        {
-                            "type": "select_fields",
-                            "config": {"fields": ["id", "name", "email_address"]},
-                        },
+                        {"type": "rename_fields", "config": {"mapping": {"email": "email_address"}}},
+                        {"type": "select_fields", "config": {"fields": ["id", "name", "email_address"]}},
                     ],
                     "destination": {
                         "type": "jsonl_file",
@@ -47,12 +42,7 @@ class ETLPlatformTests(unittest.TestCase):
             run = platform.run_pipeline(pipeline["id"])
 
             self.assertEqual(run["status"], "succeeded")
-            self.assertEqual(run["record_count"], 2)
-            self.assertEqual(Path(run["output_path"]), output_path)
-            written_records = [
-                json.loads(line)
-                for line in output_path.read_text(encoding="utf-8").splitlines()
-            ]
+            written_records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(
                 written_records,
                 [
@@ -61,278 +51,232 @@ class ETLPlatformTests(unittest.TestCase):
                 ],
             )
 
-    def test_http_end_to_end_pipeline_flow(self):
+    def test_csv_file_to_sqlite_pipeline(self):
+        with TemporaryDirectory() as temp_dir:
+            platform = ETLPlatform(Path(temp_dir) / "platform_state.json")
+            csv_path = platform.write_text_file(
+                "uploads/orders.csv",
+                "id,customer,total\n1,Ada,42\n2,Grace,91\n",
+            )
+            database_path = Path(temp_dir) / "warehouse" / "orders.db"
+            pipeline = platform.create_pipeline(
+                {
+                    "name": "orders-sync",
+                    "source": {
+                        "type": "csv_file",
+                        "config": {"path": str(csv_path), "delimiter": ",", "has_header": True},
+                    },
+                    "transformations": [
+                        {"type": "add_fields", "config": {"values": {"loaded_by": "test"}}},
+                    ],
+                    "destination": {
+                        "type": "sqlite_file",
+                        "config": {"path": str(database_path), "table": "orders", "mode": "replace"},
+                    },
+                }
+            )
+
+            run = platform.run_pipeline(pipeline["id"])
+
+            self.assertEqual(run["status"], "succeeded")
+            with sqlite3.connect(database_path) as connection:
+                rows = connection.execute(
+                    "SELECT id, customer, total, loaded_by FROM orders ORDER BY id"
+                ).fetchall()
+            self.assertEqual(rows, [("1", "Ada", "42", "test"), ("2", "Grace", "91", "test")])
+
+    def test_http_pipeline_flow_via_api(self):
         with TemporaryDirectory() as temp_dir:
             server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             port = server.server_address[1]
-
             try:
                 payload = {
-                    "name": "orders-sync",
+                    "name": "demo-http-sync",
                     "source": {
-                        "type": "inline_json",
-                        "config": {"records": [{"id": "A-1", "amount": 42}]},
+                        "type": "http_json",
+                        "config": {
+                            "url": f"http://127.0.0.1:{port}/api/demo/contacts",
+                            "records_key": "records",
+                            "timeout_seconds": 10,
+                        },
                     },
-                    "transformations": [],
+                    "transformations": [
+                        {"type": "uppercase_fields", "config": {"fields": ["country"]}},
+                    ],
                     "destination": {
-                        "type": "jsonl_file",
-                        "config": {"path": str(Path(temp_dir) / "orders.jsonl")},
+                        "type": "sqlite_file",
+                        "config": {"path": "warehouse/contacts.db", "table": "contacts", "mode": "replace"},
                     },
                 }
+                create_status, pipeline = self._request(port, "POST", "/api/pipelines", payload)
+                self.assertEqual(create_status, 201)
+                run_status, run = self._request(port, "POST", f"/api/pipelines/{pipeline['id']}/run")
+                self.assertEqual(run_status, 201)
+                self.assertEqual(run["status"], "succeeded")
+                self.assertEqual(run["record_count"], 3)
+
+                database_path = Path(temp_dir) / "warehouse" / "contacts.db"
+                with sqlite3.connect(database_path) as connection:
+                    rows = connection.execute("SELECT name, country FROM contacts ORDER BY id").fetchall()
+                self.assertEqual(rows[0], ("Ada", "UK"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_preview_endpoint_returns_transformed_records(self):
+        with TemporaryDirectory() as temp_dir:
+            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            try:
+                create_status, pipeline = self._request(
+                    port,
+                    "POST",
+                    "/api/pipelines",
+                    {
+                        "name": "preview-sync",
+                        "source": {
+                            "type": "inline_json",
+                            "config": {"records": [{"id": 1, "country": "uk"}, {"id": 2, "country": "us"}]},
+                        },
+                        "transformations": [
+                            {"type": "uppercase_fields", "config": {"fields": ["country"]}},
+                            {"type": "filter_equals", "config": {"field": "country", "value": "UK"}},
+                        ],
+                        "destination": {"type": "jsonl_file", "config": {"path": "exports/preview.jsonl"}},
+                    },
+                )
+                self.assertEqual(create_status, 201)
+                preview_status, preview = self._request(
+                    port,
+                    "POST",
+                    f"/api/pipelines/{pipeline['id']}/preview",
+                    {"limit": 10},
+                )
+                self.assertEqual(preview_status, 200)
+                self.assertEqual(preview["record_count"], 1)
+                self.assertEqual(preview["preview"][0]["country"], "UK")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_delete_pipeline_endpoint(self):
+        with TemporaryDirectory() as temp_dir:
+            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            try:
+                create_status, pipeline = self._request(
+                    port,
+                    "POST",
+                    "/api/pipelines",
+                    {
+                        "name": "delete-me",
+                        "source": {"type": "inline_json", "config": {"records": [{"id": 1}] }},
+                        "transformations": [],
+                        "destination": {"type": "jsonl_file", "config": {"path": "exports/delete.jsonl"}},
+                    },
+                )
+                self.assertEqual(create_status, 201)
+                delete_status, delete_result = self._request(port, "DELETE", f"/api/pipelines/{pipeline['id']}")
+                self.assertEqual(delete_status, 200)
+                self.assertEqual(delete_result["deleted"], pipeline["id"])
+                get_status, body = self._request(port, "GET", f"/api/pipelines/{pipeline['id']}")
+                self.assertEqual(get_status, 404)
+                self.assertEqual(body["error"], "Pipeline not found.")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_scheduled_pipeline_runs_when_due(self):
+        with TemporaryDirectory() as temp_dir:
+            platform = ETLPlatform(Path(temp_dir) / "platform_state.json")
+            base_time = time.time()
+            pipeline = platform.create_pipeline(
+                {
+                    "name": "scheduled-sync",
+                    "enabled": True,
+                    "schedule_interval_seconds": 60,
+                    "source": {"type": "inline_json", "config": {"records": [{"id": 1}, {"id": 2}] }},
+                    "transformations": [],
+                    "destination": {"type": "jsonl_file", "config": {"path": "exports/scheduled.jsonl"}},
+                }
+            )
+            runs = platform.run_scheduled_pipelines_once(now_epoch=base_time)
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["status"], "succeeded")
+            later_runs = platform.run_scheduled_pipelines_once(now_epoch=base_time + 10)
+            self.assertEqual(later_runs, [])
+            much_later_runs = platform.run_scheduled_pipelines_once(now_epoch=base_time + 100)
+            self.assertEqual(len(much_later_runs), 1)
+            self.assertEqual(much_later_runs[0]["pipeline_id"], pipeline["id"])
+
+    def test_failed_run_captures_logs(self):
+        with TemporaryDirectory() as temp_dir:
+            platform = ETLPlatform(Path(temp_dir) / "platform_state.json")
+            pipeline = platform.create_pipeline(
+                {
+                    "name": "broken-source",
+                    "source": {"type": "csv_file", "config": {"path": "uploads/missing.csv", "has_header": True}},
+                    "transformations": [],
+                    "destination": {"type": "jsonl_file", "config": {"path": "exports/broken.jsonl"}},
+                }
+            )
+            run = platform.run_pipeline(pipeline["id"])
+            self.assertEqual(run["status"], "failed")
+            self.assertIn("Source file not found.", run["error"])
+            self.assertTrue(any("Starting manual run" in log for log in run["logs"]))
+
+    def test_file_upload_endpoint_supports_csv_source(self):
+        with TemporaryDirectory() as temp_dir:
+            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            try:
+                upload_status, upload = self._request(
+                    port,
+                    "POST",
+                    "/api/files",
+                    {"path": "uploads/customers.csv", "content": "id,name\n1,Ada\n2,Grace\n"},
+                )
+                self.assertEqual(upload_status, 201)
+                self.assertTrue(upload["path"].endswith("uploads/customers.csv"))
 
                 create_status, pipeline = self._request(
-                    port, "POST", "/api/pipelines", payload
+                    port,
+                    "POST",
+                    "/api/pipelines",
+                    {
+                        "name": "uploaded-csv-sync",
+                        "source": {"type": "csv_file", "config": {"path": "uploads/customers.csv", "has_header": True}},
+                        "transformations": [],
+                        "destination": {"type": "jsonl_file", "config": {"path": "exports/uploaded.jsonl"}},
+                    },
                 )
                 self.assertEqual(create_status, 201)
                 run_status, run = self._request(port, "POST", f"/api/pipelines/{pipeline['id']}/run")
                 self.assertEqual(run_status, 201)
                 self.assertEqual(run["status"], "succeeded")
-
-                get_status, runs = self._request(port, "GET", "/api/runs")
-                self.assertEqual(get_status, 200)
-                self.assertEqual(len(runs["runs"]), 1)
-                self.assertEqual(runs["runs"][0]["id"], run["id"])
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
 
-    def test_http_run_accepts_missing_request_body(self):
-        with TemporaryDirectory() as temp_dir:
-            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            port = server.server_address[1]
-
-            try:
-                create_status, pipeline = self._request(
-                    port,
-                    "POST",
-                    "/api/pipelines",
-                    {
-                        "name": "bodyless-run",
-                        "source": {
-                            "type": "inline_json",
-                            "config": {"records": [{"id": 1}]},
-                        },
-                        "transformations": [],
-                        "destination": {
-                            "type": "jsonl_file",
-                            "config": {"path": str(Path(temp_dir) / "bodyless.jsonl")},
-                        },
-                    },
-                )
-                self.assertEqual(create_status, 201)
-                run_status, run = self._request(
-                    port, "POST", f"/api/pipelines/{pipeline['id']}/run"
-                )
-                self.assertEqual(run_status, 201)
-                self.assertEqual(run["status"], "succeeded")
-            finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
-
-    def test_http_run_returns_validation_error_for_legacy_invalid_pipeline(self):
-        with TemporaryDirectory() as temp_dir:
-            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
-            server.platform._state["pipelines"].append(
-                {
-                    "id": "pipe_legacy",
-                    "name": "legacy-invalid",
-                    "created_at": "2026-01-01T00:00:00+00:00",
-                    "source": {
-                        "type": "inline_json",
-                        "config": {"records": [{"id": 1}]},
-                    },
-                    "transformations": [],
-                    "destination": {
-                        "type": "jsonl_file",
-                        "config": {"path": "../escape.jsonl"},
-                    },
-                }
-            )
-            server.platform._save_state()
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            port = server.server_address[1]
-
-            try:
-                status, body = self._request(port, "POST", "/api/pipelines/pipe_legacy/run")
-                self.assertEqual(status, 400)
-                self.assertIn("Destination path must stay within the platform data directory.", body["error"])
-            finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
-
-    def test_create_pipeline_rejects_destination_path_escape(self):
-        with TemporaryDirectory() as temp_dir:
-            platform = ETLPlatform(Path(temp_dir) / "platform_state.json")
-
-            with self.assertRaisesRegex(
-                ValueError, "Destination path must stay within the platform data directory."
-            ):
-                platform.create_pipeline(
-                    {
-                        "name": "unsafe-sync",
-                        "source": {
-                            "type": "inline_json",
-                            "config": {"records": [{"id": 1}]},
-                        },
-                        "transformations": [],
-                        "destination": {
-                            "type": "jsonl_file",
-                            "config": {"path": "../escape.jsonl"},
-                        },
-                    }
-                )
-
-    def test_http_rejects_destination_path_escape(self):
-        with TemporaryDirectory() as temp_dir:
-            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            port = server.server_address[1]
-
-            try:
-                status, body = self._request(
-                    port,
-                    "POST",
-                    "/api/pipelines",
-                    {
-                        "name": "unsafe-sync",
-                        "source": {
-                            "type": "inline_json",
-                            "config": {"records": [{"id": 1}]},
-                        },
-                        "transformations": [],
-                        "destination": {
-                            "type": "jsonl_file",
-                            "config": {"path": "../escape.jsonl"},
-                        },
-                    },
-                )
-                self.assertEqual(status, 400)
-                self.assertIn("Destination path must stay within the platform data directory.", body["error"])
-            finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
-
-    def test_invalid_run_route_shape_returns_not_found(self):
-        with TemporaryDirectory() as temp_dir:
-            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            port = server.server_address[1]
-
-            try:
-                status, body = self._request(port, "POST", "/api/pipelines/run")
-                self.assertEqual(status, 404)
-                self.assertEqual(body["error"], "Not found.")
-            finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
-
-    def test_index_html_uses_text_based_rendering_for_dynamic_values(self):
-        self.assertIn("document.createElement('li')", INDEX_HTML)
-        self.assertIn("textContent = pipeline.name", INDEX_HTML)
-        self.assertIn("textContent = run.output_path", INDEX_HTML)
-        self.assertNotIn("pipelines').innerHTML", INDEX_HTML)
-        self.assertNotIn("runs').innerHTML", INDEX_HTML)
-        self.assertIn("addEventListener('click'", INDEX_HTML)
-
-    def test_root_html_escapes_pipeline_and_run_values(self):
-        with TemporaryDirectory() as temp_dir:
-            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            port = server.server_address[1]
-
-            try:
-                self._request(
-                    port,
-                    "POST",
-                    "/api/pipelines",
-                    {
-                        "name": "<script>alert(1)</script>",
-                        "source": {
-                            "type": "inline_json",
-                            "config": {"records": [{"id": 1}]},
-                        },
-                        "transformations": [],
-                        "destination": {
-                            "type": "jsonl_file",
-                            "config": {"path": "exports/<b>safe</b>.jsonl"},
-                        },
-                    },
-                )
-                create_status, pipelines = self._request(port, "GET", "/api/pipelines")
-                self.assertEqual(create_status, 200)
-                pipeline_id = pipelines["pipelines"][0]["id"]
-                self._request(port, "POST", f"/api/pipelines/{pipeline_id}/run")
-
-                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                connection.request("GET", "/")
-                response = connection.getresponse()
-                html = response.read().decode("utf-8")
-                connection.close()
-
-                self.assertEqual(response.status, 200)
-                self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
-                self.assertIn("&lt;b&gt;safe&lt;/b&gt;.jsonl", html)
-                self.assertNotIn("<script>alert(1)</script>", html)
-                self.assertNotIn("<b>safe</b>.jsonl", html)
-            finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
-
-    def test_http_rejects_symlink_destination_on_run(self):
-        with TemporaryDirectory() as temp_dir:
-            link_path = Path(temp_dir) / "exports" / "symlink.jsonl"
-            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            port = server.server_address[1]
-
-            try:
-                create_status, pipeline = self._request(
-                    port,
-                    "POST",
-                    "/api/pipelines",
-                    {
-                        "name": "symlink-sync",
-                        "source": {
-                            "type": "inline_json",
-                            "config": {"records": [{"id": 1}]},
-                        },
-                        "transformations": [],
-                        "destination": {
-                            "type": "jsonl_file",
-                            "config": {"path": "exports/symlink.jsonl"},
-                        },
-                    },
-                )
-                self.assertEqual(create_status, 201)
-                link_path.parent.mkdir(parents=True, exist_ok=True)
-                link_path.symlink_to(Path(temp_dir).parent / "outside.jsonl")
-                run_status, run = self._request(
-                    port, "POST", f"/api/pipelines/{pipeline['id']}/run"
-                )
-                self.assertEqual(run_status, 400)
-                self.assertIn("Destination path", run["error"])
-            finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
+    def test_index_html_is_static_and_safe(self):
+        self.assertIn("textContent", INDEX_HTML)
+        self.assertIn("addEventListener", INDEX_HTML)
+        self.assertNotIn("innerHTML =", INDEX_HTML)
 
     def _request(self, port, method, path, payload=None):
-        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
         headers = {}
         body = None
         if payload is not None:

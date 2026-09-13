@@ -1,16 +1,27 @@
 # etl
 
-Airbyte-inspired ETL MVP built with the Python standard library.
+Airbyte-inspired end-to-end ETL platform built with the Python standard library.
 
-## What it does
+## Features
 
-- creates ETL pipelines through a JSON API
-- provides a small browser UI to create and run pipelines
-- extracts records from an inline JSON source
-- applies simple transformations (`rename_fields`, `select_fields`)
-- loads results into a JSONL file destination
-- stores pipeline and run history on disk
-- keeps destination files inside the platform data directory
+- browser UI for creating, previewing, running, and deleting pipelines
+- JSON API for pipeline, file, run, dashboard, and connector management
+- source connectors:
+  - `inline_json`
+  - `csv_file`
+  - `http_json`
+- transformations:
+  - `rename_fields`
+  - `select_fields`
+  - `filter_equals`
+  - `add_fields`
+  - `uppercase_fields`
+- destinations:
+  - `jsonl_file`
+  - `sqlite_file`
+- scheduled execution with persisted run history and logs
+- built-in demo HTTP source at `/api/demo/contacts`
+- safe file handling that keeps reads and writes inside the platform data directory
 
 ## Run locally
 
@@ -26,17 +37,29 @@ Then open `http://127.0.0.1:8000`.
 python -m unittest discover -s tests -v
 ```
 
+## Complete browser workflow
+
+1. Start the server.
+2. Open the UI.
+3. Keep the default `http_json` source and `sqlite_file` destination.
+4. Click **Create pipeline**.
+5. Click **Run now** on the new pipeline.
+6. Inspect the run logs in the UI.
+7. The loaded SQLite database will be written under `data/warehouse/`.
+
 ## Example API payload
 
 ```json
 {
-  "name": "contacts-sync",
+  "name": "demo-http-sync",
+  "enabled": true,
+  "schedule_interval_seconds": 300,
   "source": {
-    "type": "inline_json",
+    "type": "http_json",
     "config": {
-      "records": [
-        { "id": 1, "name": "Ada", "email": "ada@example.com" }
-      ]
+      "url": "http://127.0.0.1:8000/api/demo/contacts",
+      "records_key": "records",
+      "timeout_seconds": 10
     }
   },
   "transformations": [
@@ -49,16 +72,52 @@ python -m unittest discover -s tests -v
       }
     },
     {
-      "type": "select_fields",
+      "type": "uppercase_fields",
       "config": {
-        "fields": ["id", "name", "email_address"]
+        "fields": ["country"]
+      }
+    },
+    {
+      "type": "add_fields",
+      "config": {
+        "values": {
+          "synced_by": "etl-platform"
+        }
       }
     }
   ],
   "destination": {
-    "type": "jsonl_file",
+    "type": "sqlite_file",
     "config": {
-      "path": "exports/contacts-sync.jsonl"
+      "path": "warehouse/contacts.db",
+      "table": "contacts",
+      "mode": "replace"
+    }
+  }
+}
+```
+
+## CSV workflow
+
+You can create a CSV source file through the API first:
+
+```json
+POST /api/files
+{
+  "path": "uploads/customers.csv",
+  "content": "id,name,email\n1,Ada,ada@example.com\n2,Grace,grace@example.com\n"
+}
+```
+
+Then create a pipeline using:
+
+```json
+{
+  "source": {
+    "type": "csv_file",
+    "config": {
+      "path": "uploads/customers.csv",
+      "has_header": true
     }
   }
 }
