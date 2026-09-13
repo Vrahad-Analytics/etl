@@ -110,28 +110,18 @@ class ETLPlatform:
             "status": "running",
             "started_at": utc_now(),
         }
-
-        try:
-            records = self._extract(pipeline["source"])
-            records = self._transform(records, pipeline.get("transformations", []))
-            output_path = self._load(records, pipeline["destination"], pipeline_id)
-            run.update(
-                {
-                    "status": "succeeded",
-                    "finished_at": utc_now(),
-                    "record_count": len(records),
-                    "output_path": str(output_path),
-                    "preview": records[:5],
-                }
-            )
-        except Exception as exc:  # pragma: no cover - defensive failure capture
-            run.update(
-                {
-                    "status": "failed",
-                    "finished_at": utc_now(),
-                    "error": str(exc),
-                }
-            )
+        records = self._extract(pipeline["source"])
+        records = self._transform(records, pipeline.get("transformations", []))
+        output_path = self._load(records, pipeline["destination"], pipeline_id)
+        run.update(
+            {
+                "status": "succeeded",
+                "finished_at": utc_now(),
+                "record_count": len(records),
+                "output_path": str(output_path),
+                "preview": records[:5],
+            }
+        )
 
         with self._lock:
             self._state["runs"].append(run)
@@ -165,6 +155,8 @@ class ETLPlatform:
         destination_path = destination.get("config", {}).get("path")
         if destination_path is not None and not isinstance(destination_path, str):
             raise ValueError("Destination path must be a string when provided.")
+        if destination_path:
+            self._resolve_destination_path(destination_path)
 
         return {
             "name": name.strip(),
@@ -220,19 +212,28 @@ class ETLPlatform:
 
     def _load(self, records, destination, pipeline_id):
         configured_path = destination.get("config", {}).get("path")
-        if configured_path:
-            output_path = Path(configured_path)
-        else:
-            output_path = self.state_path.parent / f"{pipeline_id}.jsonl"
-
-        if not output_path.is_absolute():
-            output_path = Path.cwd() / output_path
-
+        output_path = self._resolve_destination_path(configured_path, pipeline_id)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", encoding="utf-8") as handle:
             for record in records:
                 handle.write(json.dumps(record) + "\n")
         return output_path
+
+    def _resolve_destination_path(self, configured_path=None, pipeline_id=None):
+        base_dir = self.state_path.parent.resolve()
+        if configured_path:
+            output_path = Path(configured_path)
+            if not output_path.is_absolute():
+                output_path = base_dir / output_path
+        else:
+            output_path = base_dir / f"{pipeline_id}.jsonl"
+
+        resolved_path = output_path.resolve()
+        try:
+            resolved_path.relative_to(base_dir)
+        except ValueError as exc:
+            raise ValueError("Destination path must stay within the platform data directory.") from exc
+        return resolved_path
 
 
 def build_handler(platform):
@@ -374,7 +375,7 @@ INDEX_HTML = """<!doctype html>
   {"type": "rename_fields", "config": {"mapping": {"email": "email_address"}}},
   {"type": "select_fields", "config": {"fields": ["id", "name", "email_address"]}}
 ]</textarea>
-        <input id="destination" value="data/contacts-sync.jsonl" />
+        <input id="destination" value="exports/contacts-sync.jsonl" />
         <button id="create">Create pipeline</button>
         <pre id="message"></pre>
       </section>
@@ -404,17 +405,23 @@ INDEX_HTML = """<!doctype html>
         ]);
         const pipelines = await pipelinesResponse.json();
         const runs = await runsResponse.json();
+        renderPipelines(pipelines.pipelines);
+        renderRuns(runs.runs);
+      }
 
-        document.getElementById('pipelines').innerHTML = pipelines.pipelines.map((pipeline) => `
-          <li>
-            <strong>${pipeline.name}</strong> <code>${pipeline.id}</code>
-            <button data-id="${pipeline.id}">Run</button>
-          </li>
-        `).join('');
-
-        document.querySelectorAll('#pipelines button').forEach((button) => {
+      function renderPipelines(pipelines) {
+        const list = document.getElementById('pipelines');
+        list.textContent = '';
+        pipelines.forEach((pipeline) => {
+          const item = document.createElement('li');
+          const title = document.createElement('strong');
+          title.textContent = pipeline.name;
+          const id = document.createElement('code');
+          id.textContent = pipeline.id;
+          const button = document.createElement('button');
+          button.textContent = 'Run';
           button.onclick = async () => {
-            const response = await fetch(`/api/pipelines/${button.dataset.id}/run`, {
+            const response = await fetch(`/api/pipelines/${pipeline.id}/run`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({})
@@ -423,14 +430,35 @@ INDEX_HTML = """<!doctype html>
             document.getElementById('message').textContent = JSON.stringify(run, null, 2);
             refresh();
           };
+          item.appendChild(title);
+          item.appendChild(document.createTextNode(' '));
+          item.appendChild(id);
+          item.appendChild(document.createTextNode(' '));
+          item.appendChild(button);
+          list.appendChild(item);
         });
+      }
 
-        document.getElementById('runs').innerHTML = runs.runs.map((run) => `
-          <li>
-            <strong>${run.status}</strong> ${run.pipeline_id} · ${run.record_count || 0} records
-            ${run.output_path ? `<div><code>${run.output_path}</code></div>` : ''}
-          </li>
-        `).join('');
+      function renderRuns(runs) {
+        const list = document.getElementById('runs');
+        list.textContent = '';
+        runs.forEach((run) => {
+          const item = document.createElement('li');
+          const status = document.createElement('strong');
+          status.textContent = run.status;
+          item.appendChild(status);
+          item.appendChild(
+            document.createTextNode(` ${run.pipeline_id} · ${run.record_count || 0} records`)
+          );
+          if (run.output_path) {
+            const wrapper = document.createElement('div');
+            const path = document.createElement('code');
+            path.textContent = run.output_path;
+            wrapper.appendChild(path);
+            item.appendChild(wrapper);
+          }
+          list.appendChild(item);
+        });
       }
 
       document.getElementById('create').onclick = async () => {

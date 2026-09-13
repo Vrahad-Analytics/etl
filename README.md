@@ -10,6 +10,7 @@ Airbyte-inspired ETL MVP built with the Python standard library.
 - applies simple transformations (`rename_fields`, `select_fields`)
 - loads results into a JSONL file destination
 - stores pipeline and run history on disk
+- keeps destination files inside the platform data directory
 
 ## Run locally
 
@@ -57,7 +58,7 @@ python -m unittest discover -s tests -v
   "destination": {
     "type": "jsonl_file",
     "config": {
-      "path": "data/contacts-sync.jsonl"
+      "path": "exports/contacts-sync.jsonl"
     }
   }
 }

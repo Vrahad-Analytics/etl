@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from app import ETLPlatform, create_server
+from app import ETLPlatform, INDEX_HTML, create_server
 
 
 class ETLPlatformTests(unittest.TestCase):
@@ -100,6 +100,67 @@ class ETLPlatformTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+
+    def test_create_pipeline_rejects_destination_path_escape(self):
+        with TemporaryDirectory() as temp_dir:
+            platform = ETLPlatform(Path(temp_dir) / "platform_state.json")
+
+            with self.assertRaisesRegex(
+                ValueError, "Destination path must stay within the platform data directory."
+            ):
+                platform.create_pipeline(
+                    {
+                        "name": "unsafe-sync",
+                        "source": {
+                            "type": "inline_json",
+                            "config": {"records": [{"id": 1}]},
+                        },
+                        "transformations": [],
+                        "destination": {
+                            "type": "jsonl_file",
+                            "config": {"path": "../escape.jsonl"},
+                        },
+                    }
+                )
+
+    def test_http_rejects_destination_path_escape(self):
+        with TemporaryDirectory() as temp_dir:
+            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            try:
+                status, body = self._request(
+                    port,
+                    "POST",
+                    "/api/pipelines",
+                    {
+                        "name": "unsafe-sync",
+                        "source": {
+                            "type": "inline_json",
+                            "config": {"records": [{"id": 1}]},
+                        },
+                        "transformations": [],
+                        "destination": {
+                            "type": "jsonl_file",
+                            "config": {"path": "../escape.jsonl"},
+                        },
+                    },
+                )
+                self.assertEqual(status, 400)
+                self.assertIn("Destination path must stay within the platform data directory.", body["error"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_index_html_uses_text_based_rendering_for_dynamic_values(self):
+        self.assertIn("document.createElement('li')", INDEX_HTML)
+        self.assertIn("textContent = pipeline.name", INDEX_HTML)
+        self.assertIn("textContent = run.output_path", INDEX_HTML)
+        self.assertNotIn("pipelines').innerHTML", INDEX_HTML)
+        self.assertNotIn("runs').innerHTML", INDEX_HTML)
 
     def _request(self, port, method, path, payload=None):
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
