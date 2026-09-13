@@ -155,12 +155,75 @@ class ETLPlatformTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5)
 
+    def test_invalid_run_route_shape_returns_not_found(self):
+        with TemporaryDirectory() as temp_dir:
+            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            try:
+                status, body = self._request(port, "POST", "/api/pipelines/run", {})
+                self.assertEqual(status, 404)
+                self.assertEqual(body["error"], "Not found.")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
     def test_index_html_uses_text_based_rendering_for_dynamic_values(self):
         self.assertIn("document.createElement('li')", INDEX_HTML)
         self.assertIn("textContent = pipeline.name", INDEX_HTML)
         self.assertIn("textContent = run.output_path", INDEX_HTML)
         self.assertNotIn("pipelines').innerHTML", INDEX_HTML)
         self.assertNotIn("runs').innerHTML", INDEX_HTML)
+        self.assertIn("addEventListener('click'", INDEX_HTML)
+
+    def test_root_html_escapes_pipeline_and_run_values(self):
+        with TemporaryDirectory() as temp_dir:
+            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            try:
+                self._request(
+                    port,
+                    "POST",
+                    "/api/pipelines",
+                    {
+                        "name": "<script>alert(1)</script>",
+                        "source": {
+                            "type": "inline_json",
+                            "config": {"records": [{"id": 1}]},
+                        },
+                        "transformations": [],
+                        "destination": {
+                            "type": "jsonl_file",
+                            "config": {"path": "exports/<b>safe</b>.jsonl"},
+                        },
+                    },
+                )
+                create_status, pipelines = self._request(port, "GET", "/api/pipelines")
+                self.assertEqual(create_status, 200)
+                pipeline_id = pipelines["pipelines"][0]["id"]
+                self._request(port, "POST", f"/api/pipelines/{pipeline_id}/run", {})
+
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                connection.request("GET", "/")
+                response = connection.getresponse()
+                html = response.read().decode("utf-8")
+                connection.close()
+
+                self.assertEqual(response.status, 200)
+                self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
+                self.assertIn("&lt;b&gt;safe&lt;/b&gt;.jsonl", html)
+                self.assertNotIn("<script>alert(1)</script>", html)
+                self.assertNotIn("<b>safe</b>.jsonl", html)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
 
     def _request(self, port, method, path, payload=None):
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)

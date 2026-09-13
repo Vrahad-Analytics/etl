@@ -2,6 +2,7 @@ import json
 import threading
 import uuid
 from datetime import datetime, timezone
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -240,8 +241,9 @@ def build_handler(platform):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlparse(self.path)
+            path_parts = [part for part in parsed.path.split("/") if part]
             if parsed.path == "/":
-                self._html(200, INDEX_HTML)
+                self._html(200, render_index_html(platform.list_pipelines(), platform.list_runs()))
                 return
             if parsed.path == "/api/health":
                 self._json(200, {"status": "ok"})
@@ -252,8 +254,8 @@ def build_handler(platform):
             if parsed.path == "/api/pipelines":
                 self._json(200, {"pipelines": platform.list_pipelines()})
                 return
-            if parsed.path.startswith("/api/pipelines/"):
-                pipeline_id = parsed.path.rsplit("/", 1)[-1]
+            if len(path_parts) == 3 and path_parts[:2] == ["api", "pipelines"]:
+                pipeline_id = path_parts[2]
                 pipeline = platform.get_pipeline(pipeline_id)
                 if pipeline is None:
                     self._json(404, {"error": "Pipeline not found."})
@@ -263,8 +265,8 @@ def build_handler(platform):
             if parsed.path == "/api/runs":
                 self._json(200, {"runs": platform.list_runs()})
                 return
-            if parsed.path.startswith("/api/runs/"):
-                run_id = parsed.path.rsplit("/", 1)[-1]
+            if len(path_parts) == 3 and path_parts[:2] == ["api", "runs"]:
+                run_id = path_parts[2]
                 run = platform.get_run(run_id)
                 if run is None:
                     self._json(404, {"error": "Run not found."})
@@ -275,6 +277,7 @@ def build_handler(platform):
 
         def do_POST(self):
             parsed = urlparse(self.path)
+            path_parts = [part for part in parsed.path.split("/") if part]
             payload = self._read_json()
             if payload is None:
                 return
@@ -288,8 +291,8 @@ def build_handler(platform):
                 self._json(201, pipeline)
                 return
 
-            if parsed.path.startswith("/api/pipelines/") and parsed.path.endswith("/run"):
-                pipeline_id = parsed.path[len("/api/pipelines/") : -len("/run")].strip("/")
+            if len(path_parts) == 4 and path_parts[:2] == ["api", "pipelines"] and path_parts[3] == "run":
+                pipeline_id = path_parts[2]
                 try:
                     run = platform.run_pipeline(pipeline_id)
                 except KeyError:
@@ -341,7 +344,47 @@ def create_server(host="127.0.0.1", port=8000, data_dir="data"):
     return server
 
 
-INDEX_HTML = """<!doctype html>
+def render_index_html(pipelines, runs):
+    return (
+        INDEX_HTML_TEMPLATE.replace("__PIPELINES_HTML__", render_pipeline_items(pipelines))
+        .replace("__RUNS_HTML__", render_run_items(runs))
+    )
+
+
+def render_pipeline_items(pipelines):
+    items = []
+    for pipeline in pipelines:
+        items.append(
+            "<li><strong>{name}</strong> <code>{identifier}</code> "
+            '<button type="button" data-pipeline-id="{identifier_attr}">Run</button></li>'.format(
+                name=escape(pipeline["name"]),
+                identifier=escape(pipeline["id"]),
+                identifier_attr=escape(pipeline["id"], quote=True),
+            )
+        )
+    return "".join(items)
+
+
+def render_run_items(runs):
+    items = []
+    for run in runs:
+        output_html = ""
+        if run.get("output_path"):
+            output_html = "<div><code>{output_path}</code></div>".format(
+                output_path=escape(run["output_path"])
+            )
+        items.append(
+            "<li><strong>{status}</strong> {pipeline_id} · {record_count} records{output_html}</li>".format(
+                status=escape(run["status"]),
+                pipeline_id=escape(run["pipeline_id"]),
+                record_count=run.get("record_count", 0),
+                output_html=output_html,
+            )
+        )
+    return "".join(items)
+
+
+INDEX_HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -391,11 +434,11 @@ INDEX_HTML = """<!doctype html>
     </div>
     <section class="card" style="margin-top: 1.5rem;">
       <h2>Pipelines</h2>
-      <ul id="pipelines"></ul>
+      <ul id="pipelines">__PIPELINES_HTML__</ul>
     </section>
     <section class="card" style="margin-top: 1.5rem;">
       <h2>Runs</h2>
-      <ul id="runs"></ul>
+      <ul id="runs">__RUNS_HTML__</ul>
     </section>
     <script>
       async function refresh() {
@@ -420,7 +463,7 @@ INDEX_HTML = """<!doctype html>
           id.textContent = pipeline.id;
           const button = document.createElement('button');
           button.textContent = 'Run';
-          button.onclick = async () => {
+          button.addEventListener('click', async () => {
             const response = await fetch(`/api/pipelines/${pipeline.id}/run`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -429,7 +472,7 @@ INDEX_HTML = """<!doctype html>
             const run = await response.json();
             document.getElementById('message').textContent = JSON.stringify(run, null, 2);
             refresh();
-          };
+          });
           item.appendChild(title);
           item.appendChild(document.createTextNode(' '));
           item.appendChild(id);
@@ -495,6 +538,9 @@ INDEX_HTML = """<!doctype html>
   </body>
 </html>
 """
+
+
+INDEX_HTML = render_index_html([], [])
 
 
 if __name__ == "__main__":
