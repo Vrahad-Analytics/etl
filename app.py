@@ -213,7 +213,9 @@ class ETLPlatform:
     def _load(self, records, destination, pipeline_id):
         configured_path = destination.get("config", {}).get("path")
         output_path = self._resolve_destination_path(configured_path, pipeline_id)
+        self._ensure_real_parent_directories(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_real_parent_directories(output_path)
         try:
             with self._open_output_handle(output_path) as handle:
                 for record in records:
@@ -239,6 +241,18 @@ class ETLPlatform:
         except ValueError as exc:
             raise ValueError("Destination path must stay within the platform data directory.") from exc
         return resolved_path
+
+    def _ensure_real_parent_directories(self, output_path):
+        base_dir = self.state_path.parent.resolve()
+        current_path = base_dir
+        for part in output_path.relative_to(base_dir).parts[:-1]:
+            current_path = current_path / part
+            if not current_path.exists():
+                continue
+            if current_path.is_symlink():
+                raise ValueError("Destination path must not use symlinks.")
+            if not current_path.is_dir():
+                raise ValueError("Destination path parent must be a directory.")
 
     def _open_output_handle(self, output_path):
         base_dir = self.state_path.parent.resolve()
@@ -506,9 +520,7 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
           button.textContent = 'Run';
           button.addEventListener('click', async () => {
             const response = await fetch(`/api/pipelines/${pipeline.id}/run`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({})
+              method: 'POST'
             });
             const run = await response.json();
             document.getElementById('message').textContent = JSON.stringify(run, null, 2);

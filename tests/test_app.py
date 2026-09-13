@@ -99,6 +99,42 @@ class ETLPlatformTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5)
 
+    def test_http_run_accepts_missing_request_body(self):
+        with TemporaryDirectory() as temp_dir:
+            server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            try:
+                create_status, pipeline = self._request(
+                    port,
+                    "POST",
+                    "/api/pipelines",
+                    {
+                        "name": "bodyless-run",
+                        "source": {
+                            "type": "inline_json",
+                            "config": {"records": [{"id": 1}]},
+                        },
+                        "transformations": [],
+                        "destination": {
+                            "type": "jsonl_file",
+                            "config": {"path": str(Path(temp_dir) / "bodyless.jsonl")},
+                        },
+                    },
+                )
+                self.assertEqual(create_status, 201)
+                run_status, run = self._request(
+                    port, "POST", f"/api/pipelines/{pipeline['id']}/run"
+                )
+                self.assertEqual(run_status, 201)
+                self.assertEqual(run["status"], "succeeded")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
     def test_http_run_returns_validation_error_for_legacy_invalid_pipeline(self):
         with TemporaryDirectory() as temp_dir:
             server = create_server(host="127.0.0.1", port=0, data_dir=temp_dir)
