@@ -1,0 +1,28 @@
+services:
+  api:
+    build: .
+    command: python app.py api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      ETL_HOST: 0.0.0.0
+      ETL_PORT: 8000
+      ETL_DATA_DIR: data
+
+  worker:
+    build: .
+    command: python app.py worker
+    volumes:
+      - ./data:/app/data
+    environment:
+      ETL_DATA_DIR: data
+
+  scheduler:
+    build: .
+    command: python app.py scheduler
+    volumes:
+      - ./data:/app/data
+    environment:
+      ETL_DATA_DIR: data
