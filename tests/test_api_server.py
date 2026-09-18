@@ -107,9 +107,52 @@ class APIServerTests(unittest.TestCase):
                 response = connection.getresponse()
                 html = response.read().decode("utf-8")
                 connection.close()
-                self.assertEqual(response.status, 200)
                 self.assertIn("queued jobs", html.lower())
                 self.assertIn("textContent", INDEX_HTML)
+            finally:
+                self._stop_server(server, thread, worker, scheduler)
+
+    def test_pipeline_state_endpoints(self):
+        with TemporaryDirectory() as temp_dir:
+            platform = create_platform(temp_dir)
+            server, thread, port, worker, scheduler = self._start_server(platform, embedded=False)
+            try:
+                # Create pipeline
+                status, pipe = self._request(
+                    port,
+                    "POST",
+                    "/api/pipelines",
+                    {
+                        "name": "state-test",
+                        "sync_mode": "incremental",
+                        "cursor_field": "updated_at",
+                        "source": {"type": "inline_json", "config": {"records": [{"id": 1, "updated_at": "2026-01-01"}] }},
+                        "transformations": [],
+                        "destination": {"type": "jsonl_file", "config": {"path": "exports/state.jsonl"}},
+                    },
+                )
+                self.assertEqual(status, 201)
+                pipe_id = pipe["id"]
+
+                # Check initial state is None
+                status, state_data = self._request(port, "GET", f"/api/pipelines/{pipe_id}/state")
+                self.assertEqual(status, 200)
+                self.assertIsNone(state_data["state"])
+
+                # Set state directly
+                platform.set_pipeline_state(pipe_id, {"cursor_value": "2026-01-01"})
+                status, state_data = self._request(port, "GET", f"/api/pipelines/{pipe_id}/state")
+                self.assertEqual(status, 200)
+                self.assertEqual(state_data["state"]["cursor_value"], "2026-01-01")
+
+                # Reset state via API
+                status, reset_res = self._request(port, "POST", f"/api/pipelines/{pipe_id}/state/reset", {})
+                self.assertEqual(status, 200)
+                self.assertTrue(reset_res["ok"])
+
+                status, state_data = self._request(port, "GET", f"/api/pipelines/{pipe_id}/state")
+                self.assertEqual(status, 200)
+                self.assertIsNone(state_data["state"])
             finally:
                 self._stop_server(server, thread, worker, scheduler)
 

@@ -94,6 +94,19 @@ class PlatformService:
     def delete_pipeline(self, pipeline_id):
         return self.db.delete_pipeline(pipeline_id)
 
+    def get_pipeline_state(self, pipeline_id):
+        return self.db.get_pipeline_state(pipeline_id)
+
+    def set_pipeline_state(self, pipeline_id, state):
+        return self.db.set_pipeline_state(pipeline_id, state, utc_now())
+
+    def reset_pipeline_state(self, pipeline_id):
+        pipeline = self.get_pipeline(pipeline_id)
+        if pipeline is None:
+            raise KeyError(pipeline_id)
+        self.db.delete_pipeline_state(pipeline_id)
+        return {"ok": True, "message": f"Reset state for pipeline {pipeline_id}"}
+
     def list_jobs(self):
         return self.db.list_jobs()
 
@@ -159,7 +172,7 @@ class PlatformService:
         pipeline = self.get_pipeline(pipeline_id)
         if pipeline is None:
             raise KeyError(pipeline_id)
-        records = self._extract(pipeline["source"])
+        records, _ = self._extract(pipeline["source"], pipeline=pipeline)
         records = self._transform(records, pipeline.get("transformations", []))
         return {
             "pipeline_id": pipeline_id,
@@ -195,13 +208,19 @@ class PlatformService:
             self.db.append_job_log(job["id"], "Pipeline no longer exists.")
             return self.db.finish_job(job["id"], "failed", utc_now(), error="Pipeline no longer exists.")
         try:
-            self.db.append_job_log(job["id"], f"Reading source {pipeline['source']['type']}.")
-            records = self._extract(pipeline["source"])
+            self.db.append_job_log(job["id"], f"Reading source {pipeline['source']['type']} (sync mode: {pipeline.get('sync_mode', 'full_refresh')}).")
+            state = self.get_pipeline_state(pipeline["id"]) if pipeline.get("sync_mode") == "incremental" else None
+            if state:
+                self.db.append_job_log(job["id"], f"Found previous stream state checkpoint: {state}")
+            records, new_state = self._extract(pipeline["source"], pipeline=pipeline, state=state)
             self.db.append_job_log(job["id"], f"Read {len(records)} record(s).")
             records = self._transform(records, pipeline.get("transformations", []))
             self.db.append_job_log(job["id"], f"Transformed {len(records)} record(s).")
             output = self._load(records, pipeline)
             self.db.append_job_log(job["id"], f"Loaded {len(records)} record(s) into {pipeline['destination']['type']}.")
+            if new_state is not None:
+                self.set_pipeline_state(pipeline["id"], new_state)
+                self.db.append_job_log(job["id"], f"Committed new state checkpoint: {new_state}")
             return self.db.finish_job(
                 job["id"],
                 "succeeded",
@@ -242,18 +261,33 @@ class PlatformService:
         ):
             raise ValueError("schedule_interval_seconds must be a positive integer when provided.")
 
+        sync_mode = payload.get("sync_mode", "full_refresh")
+        if sync_mode not in {"full_refresh", "incremental"}:
+            raise ValueError("sync_mode must be full_refresh or incremental.")
+
+        cursor_field = payload.get("cursor_field")
+        if cursor_field is not None and (not isinstance(cursor_field, str) or not cursor_field.strip()):
+            raise ValueError("cursor_field must be a non-empty string when provided.")
+
+        primary_key = payload.get("primary_key")
+        if primary_key is not None and (not isinstance(primary_key, str) or not primary_key.strip()):
+            raise ValueError("primary_key must be a non-empty string when provided.")
+
         source = self._validate_source(payload.get("source"))
         transformations = payload.get("transformations", [])
         if not isinstance(transformations, list):
             raise ValueError("Transformations must be a list.")
         for transformation in transformations:
             self._validate_transformation(transformation)
-        destination = self._validate_destination(payload.get("destination"), name.strip())
+        destination = self._validate_destination(payload.get("destination"), name.strip(), sync_mode=sync_mode)
 
         return {
             "name": name.strip(),
             "enabled": enabled,
             "schedule_interval_seconds": schedule_interval_seconds,
+            "sync_mode": sync_mode,
+            "cursor_field": cursor_field.strip() if cursor_field else None,
+            "primary_key": primary_key.strip() if primary_key else None,
             "source": source,
             "transformations": transformations,
             "destination": destination,
@@ -303,7 +337,7 @@ class PlatformService:
 
         raise ValueError(f"Unsupported source type: {source_type}")
 
-    def _validate_destination(self, destination, pipeline_name):
+    def _validate_destination(self, destination, pipeline_name, sync_mode="full_refresh"):
         if not isinstance(destination, dict):
             raise ValueError("Destination is required.")
         destination_type = destination.get("type")
@@ -326,7 +360,9 @@ class PlatformService:
             table = config.get("table") or self.slugify(pipeline_name)
             if not isinstance(table, str) or not table.strip():
                 raise ValueError("sqlite_file table must be a non-empty string.")
-            mode = config.get("mode", "replace")
+            mode = config.get("mode")
+            if not mode:
+                mode = "append" if sync_mode == "incremental" else "replace"
             if mode not in {"replace", "append"}:
                 raise ValueError("sqlite_file mode must be replace or append.")
             destination = {"type": destination_type, "config": dict(config)}
@@ -369,9 +405,16 @@ class PlatformService:
             return
         raise ValueError(f"Unsupported transformation type: {transformation_type}")
 
-    def _extract(self, source):
+    def _extract(self, source, pipeline=None, state=None):
         try:
-            return connectors.read_source(source["type"], source.get("config", {}), self)
+            cursor_field = pipeline.get("cursor_field") if pipeline else None
+            return connectors.read_source(
+                source["type"],
+                source.get("config", {}),
+                self,
+                state=state,
+                cursor_field=cursor_field,
+            )
         except Exception as exc:
             raise PipelineExecutionError(f"Source execution failed: {exc}") from exc
 
@@ -438,6 +481,7 @@ class PlatformService:
         return resolved
 
     def ensure_real_parent_directories(self, target_path):
+        target_path = Path(target_path).resolve()
         current_path = self.data_dir
         for part in target_path.relative_to(self.data_dir).parts[:-1]:
             current_path = current_path / part
@@ -449,6 +493,7 @@ class PlatformService:
                 raise PipelineExecutionError("Path parent must be a directory.")
 
     def ensure_safe_existing_file(self, target_path):
+        target_path = Path(target_path).resolve()
         self.ensure_real_parent_directories(target_path)
         if not target_path.exists():
             raise PipelineExecutionError("Source file not found.")
@@ -458,11 +503,13 @@ class PlatformService:
             raise PipelineExecutionError("Source path must point to a file.")
 
     def ensure_safe_creatable_file(self, target_path):
+        target_path = Path(target_path).resolve()
         self.ensure_real_parent_directories(target_path)
         if target_path.exists() and target_path.is_symlink():
             raise PipelineExecutionError("Destination path must not use symlinks.")
 
-    def open_output_handle(self, output_path):
+    def open_output_handle(self, output_path, mode="w"):
+        output_path = Path(output_path).resolve()
         self.ensure_safe_creatable_file(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         self.ensure_safe_creatable_file(output_path)
@@ -472,7 +519,10 @@ class PlatformService:
             directory_flags |= os.O_DIRECTORY
         if hasattr(os, "O_NOFOLLOW"):
             directory_flags |= os.O_NOFOLLOW
-        file_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if mode == "a":
+            file_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        else:
+            file_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         if hasattr(os, "O_NOFOLLOW"):
             file_flags |= os.O_NOFOLLOW
 
@@ -487,7 +537,7 @@ class PlatformService:
                 os.close(current_fd)
                 current_fd = next_fd
             file_fd = os.open(relative_parts[-1], file_flags, 0o644, dir_fd=current_fd)
-            return os.fdopen(file_fd, "w", encoding="utf-8")
+            return os.fdopen(file_fd, mode, encoding="utf-8")
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
                 raise PipelineExecutionError("Path must not use symlinks.") from exc

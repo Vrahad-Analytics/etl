@@ -198,7 +198,7 @@ def source_discover(name, config, platform):
         return {"streams": [{"name": source_path.stem, "fields": fields}]}
 
     if name == "http_json":
-        records = read_source(name, config, platform)
+        records, _ = read_source(name, config, platform)
         fields = sorted({key for record in records for key in record.keys()})
         stream_name = Path(config.get("records_key") or "records").name
         return {"streams": [{"name": stream_name, "fields": fields}]}
@@ -206,11 +206,10 @@ def source_discover(name, config, platform):
     raise KeyError(name)
 
 
-def read_source(name, config, platform):
+def read_source(name, config, platform, state=None, cursor_field=None):
     if name == "inline_json":
-        return [dict(record) for record in config["records"]]
-
-    if name == "csv_file":
+        raw_records = [dict(record) for record in config["records"]]
+    elif name == "csv_file":
         source_path = platform.resolve_storage_path(config.get("path"))
         platform.ensure_safe_existing_file(source_path)
         delimiter = config.get("delimiter", ",")
@@ -220,13 +219,13 @@ def read_source(name, config, platform):
         with source_path.open("r", encoding=encoding, newline="") as handle:
             if has_header:
                 reader = csv.DictReader(handle, delimiter=delimiter)
-                return [dict(row) for row in reader]
-            if not field_names:
-                raise ValueError("csv_file without headers requires field_names")
-            reader = csv.reader(handle, delimiter=delimiter)
-            return [dict(zip(field_names, row)) for row in reader]
-
-    if name == "http_json":
+                raw_records = [dict(row) for row in reader]
+            else:
+                if not field_names:
+                    raise ValueError("csv_file without headers requires field_names")
+                reader = csv.reader(handle, delimiter=delimiter)
+                raw_records = [dict(zip(field_names, row)) for row in reader]
+    elif name == "http_json":
         payload = _fetch_http_json(config)
         records_key = config.get("records_key")
         if records_key:
@@ -235,9 +234,55 @@ def read_source(name, config, platform):
             payload = payload["records"]
         if not isinstance(payload, list) or any(not isinstance(record, dict) for record in payload):
             raise ValueError("http_json source must resolve to a list of objects")
-        return payload
+        raw_records = [dict(record) for record in payload]
+    else:
+        raise KeyError(name)
 
-    raise KeyError(name)
+    # Airbyte-style Incremental state filtering
+    cursor_value = state.get("cursor_value") if isinstance(state, dict) else None
+    if cursor_field and cursor_value is not None:
+        filtered = []
+        for r in raw_records:
+            val = r.get(cursor_field)
+            if val is None:
+                continue
+            try:
+                if isinstance(cursor_value, (int, float)) or (isinstance(cursor_value, str) and cursor_value.isdigit()):
+                    if float(val) > float(cursor_value):
+                        filtered.append(r)
+                else:
+                    if str(val) > str(cursor_value):
+                        filtered.append(r)
+            except (ValueError, TypeError):
+                if str(val) > str(cursor_value):
+                    filtered.append(r)
+        records = filtered
+    else:
+        records = raw_records
+
+    # Track new state cursor
+    new_state = None
+    if cursor_field and records:
+        highest = None
+        for r in records:
+            v = r.get(cursor_field)
+            if v is None:
+                continue
+            if highest is None:
+                highest = v
+            else:
+                try:
+                    if float(v) > float(highest):
+                        highest = v
+                except (ValueError, TypeError):
+                    if str(v) > str(highest):
+                        highest = v
+        if highest is not None:
+            new_state = {"cursor_field": cursor_field, "cursor_value": highest}
+    elif state:
+        new_state = dict(state)
+
+    return records, new_state
 
 
 def _fetch_http_json(config):
@@ -246,34 +291,41 @@ def _fetch_http_json(config):
 
 
 def write_destination(name, config, records, platform, pipeline):
+    sync_mode = pipeline.get("sync_mode", "full_refresh")
+    primary_key = pipeline.get("primary_key")
+
     if name == "jsonl_file":
         default_name = f"exports/{pipeline['id']}.jsonl"
         output_path = platform.resolve_storage_path(config.get("path"), default_name)
         platform.ensure_safe_creatable_file(output_path)
-        with platform.open_output_handle(output_path) as handle:
+        write_mode = "a" if sync_mode == "incremental" and output_path.exists() else "w"
+        with platform.open_output_handle(output_path, mode=write_mode) as handle:
             for record in records:
                 handle.write(json.dumps(record) + "\n")
-        return {"type": "jsonl_file", "path": str(output_path), "row_count": len(records)}
+        return {"type": "jsonl_file", "path": str(output_path), "row_count": len(records), "mode": write_mode}
 
     if name == "sqlite_file":
         default_name = f"warehouse/{pipeline['id']}.db"
         output_path = platform.resolve_storage_path(config.get("path"), default_name)
         platform.ensure_safe_creatable_file(output_path)
         table = config.get("table") or platform.slugify(pipeline["name"])
-        mode = config.get("mode", "replace")
-        _load_sqlite(output_path, table, mode, records, platform)
+        mode = config.get("mode")
+        if not mode:
+            mode = "append" if sync_mode == "incremental" else "replace"
+        _load_sqlite(output_path, table, mode, records, platform, primary_key=primary_key)
         return {
             "type": "sqlite_file",
             "path": str(output_path),
             "table": table,
             "mode": mode,
+            "primary_key": primary_key,
             "row_count": len(records),
         }
 
     raise KeyError(name)
 
 
-def _load_sqlite(output_path, table_name, mode, records, platform):
+def _load_sqlite(output_path, table_name, mode, records, platform, primary_key=None):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     platform.ensure_safe_creatable_file(output_path)
     connection = sqlite3.connect(output_path)
@@ -289,15 +341,18 @@ def _load_sqlite(output_path, table_name, mode, records, platform):
             return
         column_sql = []
         for column in columns:
-            values = [record.get(column) for record in records if record.get(column) is not None]
-            column_sql.append(f"{platform.quote_identifier(column)} {platform.infer_sqlite_type(values)}")
+            col_def = f"{platform.quote_identifier(column)} {platform.infer_sqlite_type([r.get(column) for r in records if r.get(column) is not None])}"
+            if primary_key and column == primary_key:
+                col_def += " PRIMARY KEY"
+            column_sql.append(col_def)
         cursor.execute(f"CREATE TABLE IF NOT EXISTS {quoted_table} ({', '.join(column_sql)})")
         if records:
             placeholders = ", ".join("?" for _ in columns)
             insert_columns = ", ".join(platform.quote_identifier(column) for column in columns)
+            verb = "INSERT OR REPLACE" if primary_key else "INSERT"
             rows = [tuple(platform.sqlite_value(record.get(column)) for column in columns) for record in records]
             cursor.executemany(
-                f"INSERT INTO {quoted_table} ({insert_columns}) VALUES ({placeholders})",
+                f"{verb} INTO {quoted_table} ({insert_columns}) VALUES ({placeholders})",
                 rows,
             )
         connection.commit()

@@ -52,6 +52,15 @@ INDEX_HTML = """<!doctype html>
           <option value="jsonl_file">jsonl_file</option>
         </select>
         <textarea id="destinationConfig"></textarea>
+        <label>Sync mode</label>
+        <select id="syncMode">
+          <option value="full_refresh">Full Refresh</option>
+          <option value="incremental">Incremental</option>
+        </select>
+        <label>Cursor field (for incremental sync)</label>
+        <input id="cursorField" placeholder="e.g. id or updated_at" />
+        <label>Primary key (for deduplication / upsert)</label>
+        <input id="primaryKey" placeholder="e.g. id" />
         <label>Schedule interval seconds (optional)</label>
         <input id="scheduleInterval" placeholder="60" />
         <button id="create">Create pipeline</button>
@@ -102,6 +111,9 @@ INDEX_HTML = """<!doctype html>
       const sourceConfig = document.getElementById('sourceConfig');
       const destinationConfig = document.getElementById('destinationConfig');
       const transformations = document.getElementById('transformations');
+      const syncMode = document.getElementById('syncMode');
+      const cursorField = document.getElementById('cursorField');
+      const primaryKey = document.getElementById('primaryKey');
       const message = document.getElementById('message');
 
       function setDefaults() {
@@ -140,13 +152,13 @@ INDEX_HTML = """<!doctype html>
       function renderConnectors(catalog) {
         const root = document.getElementById('connectors');
         root.textContent = '';
-        ['sources', 'destinations', 'transformations'].forEach((group) => {
-          catalog[group].forEach((item) => {
+        [['Sources', catalog.sources], ['Destinations', catalog.destinations], ['Transformations', catalog.transformations]].forEach(([title, items]) => {
+          const header = document.createElement('h3');
+          header.textContent = title;
+          root.appendChild(header);
+          items.forEach((item) => {
             const li = document.createElement('li');
-            const code = document.createElement('code');
-            code.textContent = item.type;
-            li.appendChild(code);
-            li.appendChild(document.createTextNode(` — ${item.description}`));
+            li.textContent = `${item.name} (${item.type}) — ${item.description}`;
             root.appendChild(li);
           });
         });
@@ -162,11 +174,14 @@ INDEX_HTML = """<!doctype html>
           li.appendChild(title);
           const pill = document.createElement('span');
           pill.className = 'pill';
-          pill.textContent = ` ${pipeline.source.type} → ${pipeline.destination.type}`;
+          pill.textContent = ` ${pipeline.source.type} → ${pipeline.destination.type} [${pipeline.sync_mode || 'full_refresh'}]`;
           li.appendChild(document.createTextNode(' '));
           li.appendChild(pill);
           li.appendChild(document.createElement('br'));
-          li.appendChild(document.createTextNode(`status=${pipeline.last_run_status || 'never'} schedule=${pipeline.schedule_interval_seconds || 'manual'}`));
+          const infoText = `status=${pipeline.last_run_status || 'never'} schedule=${pipeline.schedule_interval_seconds || 'manual'}` +
+            (pipeline.cursor_field ? ` cursor=${pipeline.cursor_field}` : '') +
+            (pipeline.primary_key ? ` pk=${pipeline.primary_key}` : '');
+          li.appendChild(document.createTextNode(infoText));
           li.appendChild(document.createElement('br'));
           [['Run now', async () => {
             const job = await fetchJson(`/api/pipelines/${pipeline.id}/run`, { method: 'POST' });
@@ -174,6 +189,12 @@ INDEX_HTML = """<!doctype html>
           }], ['Preview', async () => {
             const preview = await fetchJson(`/api/pipelines/${pipeline.id}/preview`, { method: 'POST' });
             message.textContent = JSON.stringify(preview, null, 2);
+          }, 'secondary'], ['State', async () => {
+            const state = await fetchJson(`/api/pipelines/${pipeline.id}/state`);
+            message.textContent = JSON.stringify(state, null, 2);
+          }, 'secondary'], ['Reset State', async () => {
+            const res = await fetchJson(`/api/pipelines/${pipeline.id}/state/reset`, { method: 'POST' });
+            message.textContent = JSON.stringify(res, null, 2);
           }, 'secondary'], ['Delete', async () => {
             await fetchJson(`/api/pipelines/${pipeline.id}`, { method: 'DELETE' });
           }, 'danger']].forEach(([label, handler, kind]) => {
@@ -237,6 +258,9 @@ INDEX_HTML = """<!doctype html>
           const payload = {
             name: document.getElementById('name').value,
             enabled: true,
+            sync_mode: syncMode.value,
+            cursor_field: cursorField.value.trim() || undefined,
+            primary_key: primaryKey.value.trim() || undefined,
             source: { type: sourceType.value, config: JSON.parse(sourceConfig.value) },
             transformations: JSON.parse(transformations.value),
             destination: { type: destinationType.value, config: JSON.parse(destinationConfig.value) }
@@ -338,6 +362,14 @@ def build_handler(platform):
                     return
                 self._json(200, pipeline)
                 return
+            if len(parts) == 4 and parts[:2] == ["api", "pipelines"] and parts[3] == "state":
+                pipeline = platform.get_pipeline(parts[2])
+                if pipeline is None:
+                    self._json(404, {"error": "Pipeline not found."})
+                    return
+                state = platform.get_pipeline_state(parts[2])
+                self._json(200, {"pipeline_id": parts[2], "state": state})
+                return
             if parsed.path == "/api/jobs":
                 self._json(200, {"jobs": platform.list_jobs()})
                 return
@@ -424,6 +456,13 @@ def build_handler(platform):
                     self._json(404, {"error": "Pipeline not found."})
                 except PipelineExecutionError as exc:
                     self._json(400, {"error": str(exc)})
+                return
+
+            if len(parts) == 5 and parts[:2] == ["api", "pipelines"] and parts[3] == "state" and parts[4] == "reset":
+                try:
+                    self._json(200, platform.reset_pipeline_state(parts[2]))
+                except KeyError:
+                    self._json(404, {"error": "Pipeline not found."})
                 return
 
             self._json(404, {"error": "Not found."})
